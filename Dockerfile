@@ -17,6 +17,8 @@ import asyncio
 import contextlib
 import hmac
 import os
+import json
+import base64
 import secrets
 import time
 from urllib.parse import urlsplit
@@ -24,7 +26,7 @@ from urllib.parse import urlsplit
 import httpx
 import websockets
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 
@@ -102,7 +104,7 @@ document.querySelector('#key').value='';if(r.ok)location.reload();else document.
 <button onclick="mode('manual')">직접 조작 시작</button>
 <button onclick="mode('automation')">로그인 완료 · 자동화에 제어 넘기기</button>
 <button onclick="logout()">접속 종료</button><p id="status"></p>
-<a id="screen" target="_blank" rel="noopener" hidden href="/novnc/vnc.html?autoconnect=true&amp;reconnect=false&amp;resize=scale&amp;path=vnc">브라우저 화면 열기</a>
+<a id="screen" target="_blank" rel="noopener" hidden href="/screen">브라우저 화면 열기</a>
 <script>async function mode(mode){const r=await fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})});
 document.querySelector('#status').textContent=r.ok?(mode==='manual'?'직접 조작 중':'자동화에 제어를 넘겼습니다'):'변경 실패';
 document.querySelector('#screen').hidden=!r.ok||mode!=='manual';}
@@ -255,6 +257,109 @@ async function logout(){await fetch('/logout',{method:'POST'});location.reload()
             with contextlib.suppress(Exception):
                 await ws.close()
 
+    screen_lock = asyncio.Lock()
+
+    async def screen_command(method, params=None):
+        # Only standard browser CDP commands; never Naver's internal APIs/models.
+        async with httpx.AsyncClient(trust_env=False) as client:
+            r = await client.get('http://127.0.0.1:9222/json/list', timeout=5)
+            pages = [p for p in r.json() if p.get('type') == 'page']
+        if not pages:
+            raise RuntimeError('No browser tab')
+        endpoint = pages[0]['webSocketDebuggerUrl']
+        address = urlsplit(endpoint)
+        if address.hostname not in ('localhost', '127.0.0.1') or address.port != 9222:
+            raise RuntimeError('Unexpected browser address')
+        async with websockets.connect(endpoint, proxy=None, max_size=8*1024*1024) as channel:
+            await channel.send(json.dumps({'id': 1, 'method': method, 'params': params or {}}))
+            while True:
+                message = json.loads(await asyncio.wait_for(channel.recv(), 10))
+                if message.get('id') == 1:
+                    if 'error' in message:
+                        raise RuntimeError('Browser command failed')
+                    return message.get('result', {})
+
+    def manual_user(request):
+        return signed_in(request) and not app.state.automation
+
+    @app.get('/screen')
+    async def screen(request: Request):
+        if not manual_user(request):
+            return JSONResponse({'error': 'manual authenticated session required'}, status_code=403)
+        return HTMLResponse('''<!doctype html><html lang="ko"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>네이버 직접 로그인</title>
+<style>body{font-family:sans-serif;margin:12px}img{width:100%;border:1px solid #aaa;touch-action:manipulation}textarea{width:95%;font-size:18px}button{padding:10px;margin:4px}</style>
+<h2>네이버 직접 로그인</h2><p>사진 화면을 눌러 입력 위치를 선택한 다음 아래 입력란을 사용하세요. 입력값은 기록하지 않습니다. 화면은 10분 후 멈춥니다.</p>
+<button onclick="send('navigate')">네이버 글쓰기 열기</button><button onclick="send('key',{key:'Tab'})">다음 입력칸</button><button onclick="send('key',{key:'Enter'})">Enter</button><button onclick="send('key',{key:'Backspace'})">한 글자 지우기</button>
+<p id="state">화면 연결 중</p><img id="view" alt="현재 Chrome 화면"><br>
+<label><input type="checkbox" id="secret" onchange="changeType()" checked>입력 내용 가리기</label>
+<input type="password" id="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="선택한 네이버 입력칸에 보낼 내용" style="width:95%;font-size:18px">
+<button onclick="typeText()">선택한 칸에 입력</button><button onclick="send('scroll',{delta:550})">아래로</button><button onclick="send('scroll',{delta:-550})">위로</button>
+<p>로그인이 끝나면 이 탭을 닫고 원래 제어 페이지에서 ‘로그인 완료 · 자동화에 제어 넘기기’를 누르세요.</p>
+<script>
+const view=document.querySelector('#view'),state=document.querySelector('#state');let url=null,stopped=false;
+async function send(action,data={}){const r=await fetch('/screen/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,...data})});if(!r.ok)state.textContent='조작 실패: 수동 모드와 로그인을 확인하세요.';}
+async function typeText(){const box=document.querySelector('#text');const value=box.value;box.value='';if(value)await send('text',{text:value});}
+function changeType(){document.querySelector('#text').type=document.querySelector('#secret').checked?'password':'text';}
+view.onclick=e=>{const b=view.getBoundingClientRect();send('click',{x:(e.clientX-b.left)*view.naturalWidth/b.width,y:(e.clientY-b.top)*view.naturalHeight/b.height});};
+async function refresh(){if(stopped)return;try{const r=await fetch('/screen/frame');if(!r.ok){state.textContent='화면 중지: 수동 모드와 로그인을 확인하세요.';stopped=true;return;}const next=URL.createObjectURL(await r.blob());view.src=next;if(url)URL.revokeObjectURL(url);url=next;state.textContent='현재 Chrome 주소: '+(r.headers.get('X-Browser-Origin')||'확인 중');}catch(e){state.textContent='연결 재확인 중';}if(!stopped)setTimeout(refresh,1500);}
+setTimeout(()=>{stopped=true;document.querySelector('#text').value='';state.textContent='10분이 지나 화면 갱신을 멈췄습니다. 필요하면 새로고침하세요.';},600000);refresh();
+</script></html>''')
+
+    @app.get('/screen/frame')
+    async def screen_frame(request: Request):
+        async with app.state.mode_lock:
+            if not manual_user(request):
+                return JSONResponse({'error': 'manual session required'}, status_code=403)
+            async with screen_lock:
+                try:
+                    tree = await screen_command('Page.getFrameTree')
+                    current = urlsplit(tree['frameTree']['frame']['url'])
+                    shown_origin = current.scheme + '://' + current.hostname if current.hostname else 'about:blank'
+                    result = await screen_command('Page.captureScreenshot', {'format': 'jpeg', 'quality': 45})
+                    return Response(base64.b64decode(result['data']), media_type='image/jpeg',
+                                    headers={'X-Browser-Origin': shown_origin})
+                except Exception:
+                    return JSONResponse({'error': 'browser frame unavailable'}, status_code=503)
+
+    @app.post('/screen/input')
+    async def screen_input(request: Request):
+        async with app.state.mode_lock:
+            if not manual_user(request) or not same_origin(request):
+                return JSONResponse({'error': 'manual authenticated origin required'}, status_code=403)
+            if len(await request.body()) > 20000:
+                return JSONResponse({'error': 'input too large'}, status_code=413)
+            data = await request.json()
+            action = data.get('action')
+            async with screen_lock:
+                try:
+                    if action == 'navigate':
+                        await screen_command('Page.navigate', {'url': 'https://blog.naver.com/dividendwhisky/postwrite'})
+                    elif action == 'text' and isinstance(data.get('text'), str) and len(data['text']) <= 4096:
+                        await screen_command('Input.insertText', {'text': data['text']})
+                    elif action == 'click':
+                        x, y = float(data['x']), float(data['y'])
+                        if not (0 <= x <= 4096 and 0 <= y <= 4096):
+                            return JSONResponse({'error': 'coordinates'}, status_code=400)
+                        for event in ('mousePressed', 'mouseReleased'):
+                            await screen_command('Input.dispatchMouseEvent', {'type': event, 'x': x, 'y': y,
+                                'button': 'left', 'clickCount': 1})
+                    elif action == 'key' and data.get('key') in ('Tab', 'Enter', 'Backspace'):
+                        code = {'Tab': 9, 'Enter': 13, 'Backspace': 8}[data['key']]
+                        for event in ('keyDown', 'keyUp'):
+                            await screen_command('Input.dispatchKeyEvent', {'type': event, 'key': data['key'],
+                                'code': data['key'], 'windowsVirtualKeyCode': code,
+                                **({'text': '\r'} if data['key'] == 'Enter' and event == 'keyDown' else {})})
+                    elif action == 'scroll':
+                        delta = max(-600, min(600, float(data['delta'])))
+                        await screen_command('Input.dispatchMouseEvent', {'type': 'mouseWheel',
+                            'x': 350, 'y': 350, 'deltaX': 0, 'deltaY': delta})
+                    else:
+                        return JSONResponse({'error': 'unsupported action'}, status_code=400)
+                    return {'ok': True}
+                except Exception:
+                    return JSONResponse({'error': 'browser command failed'}, status_code=503)
+
     novnc = os.environ.get('SHINWOL_NOVNC_PATH', '/usr/share/novnc')
     if os.path.isdir(novnc):
         app.mount('/novnc', StaticFiles(directory=novnc), name='novnc')
@@ -315,7 +420,6 @@ if proxy_ca:
 os.environ['DISPLAY'] = ':99'
 start(['Xvfb', ':99', '-screen', '0', '1280x900x24', '-nolisten', 'tcp'])
 time.sleep(1)
-start(['x11vnc', '-display', ':99', '-localhost', '-rfbport', '5900', '-nopw', '-forever', '-shared'])
 chrome = ['chromium', '--no-sandbox', '--disable-dev-shm-usage', '--disable-crashpad-for-testing',
           '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=9222',
           '--user-data-dir=/data/chrome', '--no-first-run', '--no-default-browser-check',
